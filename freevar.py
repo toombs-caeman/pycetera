@@ -2,85 +2,65 @@ import functools
 import inspect
 import unittest
 
-import operator
-import builtins
-
 from decorators import singleton
 from operator import *
 
-ALLOWED_METHODS = dir(operator) + dir(builtins)
+attr = attrgetter
+call = methodcaller
 
+class rpartial(functools.partial):
+    """exactly like functools.partial, but it reverses the order of supplied and enclosed positional arguments"""
+    def __call__(*args, **keywords):
+        if not args:
+            raise TypeError("descriptor '__call__' of partial needs an argument")
+        self, *args = args
+        newkeywords = self.keywords.copy()
+        newkeywords.update(keywords)
+        return self.func(*args, *self.args, **newkeywords)
 
-class L:
+@singleton()
+class X:
     """a lambda constructor interface"""
-    def __init__(self):
-        self.__stack__ = []
-        self._f = None
+    def __init__(self, *, stack=(), flag=None):
+        self.__stack = stack
+        self.__flag = flag
 
-    def __delay__(self, func, *args):
-        requires = len(inspect.signature(func).parameters) - len(args)
-
-        # can't use functools.partial because it gets the arguments backwards
-        @functools.wraps(func)
-        def newfunc(*fargs):
-            return func(*fargs, *args)
-
-        self.__stack__.append((
-            requires,
-            newfunc,
-        ))
+    def __delay__(self, func, *args, **kwargs):
+        if func in (methodcaller, itemgetter, attrgetter):
+            f = func(*args, **kwargs)
+            req = 1
+        else:
+            f = rpartial(func, *args, **kwargs)
+            req = len(inspect.signature(f).parameters)
+        return type(self)(stack=(*self.__stack,(req, f)))
 
     def __getitem__(self, item):
-        if self._f:
-            self.__delay__(attrgetter, self._f.__name__)
-            self._f = None
-        self.__delay__(getitem, item)
-        return self
+        if self.__flag:
+            raise AttributeError()
+        return self.__delay__(itemgetter, item)
 
-    def __getattribute__(self, item):
-        try:
-            return object.__getattribute__(self, item)
-        except:
-            pass
-        if self._f:
-            self.__delay__(attrgetter, self._f.__name__)
-            self._f = None
-
-        # if item is in the local namespace, then use that as a function for _f
-        if item in ALLOWED_METHODS:
-            self._f = eval(item)
-        else:
-            self.__delay__(lambda x, y: getattr(x, y), item)
-        return self
+    def __getattr__(self, item):
+        if self.__flag:
+            raise AttributeError()
+        return type(self)(stack=self.__stack, flag=eval(item))
 
     def __call__(self, *args, **kwargs):
-        if self._f:
-            self.__delay__(self._f, *args, **kwargs)
-            self._f = None
-            return self
+        if self.__flag:
+            return self.__delay__(self.__flag, *args, **kwargs)
         # given a list of callables return a function which calls them in order
         # and tries to insert arguments where they go
         args = list(args)
-        if sum(map(lambda x: x[0], self.__stack__)) + 1 != len(args) + len(self.__stack__):
-            raise ValueError("number of args doesn't match number of slots", args, self.__stack__)
-        for p, f in self.__stack__:
+        # compare the number of arguments needed to the number of arguments given + produced
+        if sum(map(itemgetter(0), self.__stack)) + 1 != len(args) + len(self.__stack):
+            # pass
+            raise ValueError("number of args doesn't match number of slots", args, self.__stack)
+        for p, f in self.__stack:
             v = f(*args[:p])
             args = [v] + args[p:]
         else:
             return args[0]
         return v
 
-
-@singleton()
-class X:
-    def __getattribute__(self, item):
-        return getattr(L(), item)
-
-    def __getitem__(self, item):
-        return L()[item]
-
-    def __call__(self, *args, **kwargs):
-        return L()(*args, **kwargs)
 
 
 class TestLambda(unittest.TestCase):
@@ -103,7 +83,7 @@ class TestLambda(unittest.TestCase):
 
     def test_lambda_getattr(self):
         o = [type('', (), {"v": i})() for i in range(10)]
-        self.assertEqual(list(map(X.v, o)), [i.v for i in o])
+        self.assertEqual(list(map(X.attr('v'), o)), [i.v for i in o])
         pass
 
     def test_lambda_getitem(self):
