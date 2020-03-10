@@ -1,5 +1,42 @@
 import functools
+import itertools
 import unittest
+import types
+
+
+def derived(_t):
+    """
+    construct a derived type that wraps all methods of the base
+    so that those functions return the derived type when they would return the base
+
+    currently only works if the constructor for the derived type accepts
+    the base instance as its sole argument
+    """
+    name = 'derived_{}'.format(_t.__name__)
+    bases = (_t,)
+    body = {}
+
+    def wrap(_m):
+        def method_wrapper(self, *args, **kwargs):
+            ret = getattr(_t, _m)(self, *args, **kwargs)
+            if isinstance(ret, _t):
+                return type(self)(ret)
+            return ret
+
+        return method_wrapper
+
+    for m in dir(_t):
+        attr = getattr(_t, m)
+        if isinstance(
+                attr,
+                (
+                        types.FunctionType,
+                        types.WrapperDescriptorType,
+                        types.MethodDescriptorType,
+                )
+        ):
+            body[m] = functools.wraps(attr)(wrap(m))
+    return type(name, bases, body)
 
 
 class Group:
@@ -15,15 +52,51 @@ class Group:
             return type(self)(filter(item, self))
         raise TypeError("couldn't filter on " + str(item))
 
-    def reduce(self, f, i=None):
-        return functools.reduce(f, self, i)
+    # FUNCTOOLS/ITERTOOLS SUGAR
+    @functools.wraps(functools.reduce)
+    def reduce(self, f, initial=None):
+        return functools.reduce(f, self, initial)
 
-    def branch(self, condition, *branches, default=lambda x: x):
-        return type(self)(
-            (branches[branch] if 0 <= branch < len(branches) else default)(item)
-            for branch, item
-            in zip(self(condition), self)
-        )
+    @functools.wraps(itertools.groupby)
+    def groupby(self, key=None):
+        return type(self)(itertools.groupby(self, key=key))
+
+    @functools.wraps(itertools.chain)
+    def chain(self, *i):
+        return type(self)(itertools.chain(self, *i))
+
+    @functools.wraps(zip)
+    def zip(self, *i):
+        return type(self)(zip(self, *i))
+
+    @functools.wraps(itertools.zip_longest)
+    def zip_longest(self, *i, fillvalue=None):
+        return type(self)(itertools.zip_longest(self, *i, fillvalue=fillvalue))
+
+    @functools.wraps(itertools.cycle)
+    def cycle(self):
+        return type(self)(itertools.cycle(self))
+
+    @functools.wraps(itertools.tee)
+    def tee(self, n=2):
+        return Tuple(map(Iter, itertools.tee(self, n=n)))
+
+    @functools.wraps(itertools.repeat)
+    def repeat(self, times=None):
+        return type(self)(itertools.repeat(self, times=times))
+
+    # TYPE CONVERSION
+    def iter(self):
+        return Iter(self)
+
+    def set(self):
+        return Set(self)
+
+    def list(self):
+        return List(self)
+
+    def tuple(self):
+        return Tuple(self)
 
 
 class OrderedGroup(Group):
@@ -36,27 +109,39 @@ class OrderedGroup(Group):
             # get the next super type after group
             mro = type(self).__mro__
             s = mro[mro.index(Group) + 1]
-            if isinstance(item, slice):
-                return type(self)(s.__getitem__(self, item))
             return s.__getitem__(self, item)
 
-    def set(self):
-        return Set(self)
+
+class Iter(Group):
+
+    def __init__(self, i):
+        self.iter = iter(i)
+        while isinstance(self.iter, Iter):
+            self.iter = self.iter.iter
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.iter)
+
+    def __getitem__(self, item):
+        """apply one or more filters over this group."""
+        return type(self)(filter(item, self))
 
 
-class List(OrderedGroup, list):
+class List(OrderedGroup, derived(list)):
     """A lightweight list class that provides extended map and filter syntax."""
-    pass
 
 
-class Tuple(OrderedGroup, tuple):
+class Tuple(OrderedGroup, derived(tuple)):
     """A lightweight tuple class that provides extended map and filter syntax."""
-    pass
 
 
-class Set(Group, set):
+class Set(Group, derived(set)):
     """A lightweight set class that provides extended map and filter syntax."""
 
+    @functools.wraps(sorted)
     def sort(self, key=None, reverse=False):
         return List(sorted(self, key=key, reverse=reverse))
 
@@ -100,13 +185,6 @@ class TestList(unittest.TestCase):
     @unittest.skip
     def test_reduce(self):
         self.fail("TODO")
-
-    def test_branch(self):
-        l = self.g_lambdas[:2]
-        self.assertEqual(
-            self.g.branch(lambda x: x % 3, *l),
-            [l[0](x) if x % 3 == 0 else l[1](x) if x % 3 == 1 else x for x in self.g],
-        )
 
 
 if __name__ == '__main__':
