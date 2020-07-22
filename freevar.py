@@ -62,18 +62,23 @@ class X:
     When the queue is exhausted, the top value of the stack is returned.
 
     """
+    __slots__ = ["__queue", "__flag"]
 
     def __init__(self, *, queue=(), flag=None):
         self.__queue = queue
         self.__flag = flag
 
     def __delay__(self, func, *args, **kwargs):
+        req = 1
         if func in (methodcaller, itemgetter, attrgetter):
             f = func(*args, **kwargs)
-            req = 1
         else:
             f = rpartial(func, *args, **kwargs)
-            req = len(inspect.signature(f).parameters)
+            try:
+                req = len(inspect.signature(f).parameters)
+            except ValueError:
+                # some builtins don't have signatures
+                pass
         return type(self)(queue=(*self.__queue, (req, f)))
 
     def __getitem__(self, item):
@@ -137,7 +142,7 @@ class TestLambda(unittest.TestCase):
 
     def test_emulations(self):
         _types = [1, 'a', 4.7]
-        g=list(range(7,10))
+        g = list(range(7, 10))
         s = ('{}', 'ump', 'hello {}!', 'wazzup home {}')
         self.assertEqual(list(filter(X.contains('h'), s)), [i for i in s if 'h' in i])
         self.assertEqual(list(map(X.mul(2.), g)), [i * 2. for i in g])

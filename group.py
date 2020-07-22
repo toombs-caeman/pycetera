@@ -1,32 +1,42 @@
+import collections
 import functools
 import itertools
 import unittest
 import types
 
 
-def derived(_t):
+def derived(type_, also_wrap=None):
     """
     construct a derived type that wraps all methods of the base
-    so that those functions return the derived type when they would return the base
+    so that those functions return the instance type when they would return the base
 
     currently only works if the constructor for the derived type accepts
     the base instance as its sole argument
     """
-    name = 'derived_{}'.format(_t.__name__)
-    bases = (_t,)
+    # default values
+    if also_wrap is None:
+        also_wrap = {}
+
+    # components of the type
+    name = 'derived_{}'.format(type_.__name__)
+    bases = (type_,)
     body = {}
 
     def wrap(_m):
         def method_wrapper(self, *args, **kwargs):
-            ret = getattr(_t, _m)(self, *args, **kwargs)
-            if isinstance(ret, _t):
+            # call to the derived type's method
+            ret = getattr(type_, _m)(self, *args, **kwargs)
+            if isinstance(ret, type_):
+                # wrap as the type of self
                 return type(self)(ret)
-            return ret
+            # otherwise try to wrap other types
+            return also_wrap.get(type(ret), lambda x:x)(ret)
 
         return method_wrapper
 
-    for m in dir(_t):
-        attr = getattr(_t, m)
+    # wrap all methods of the derived type
+    for m in dir(type_):
+        attr = getattr(type_, m)
         if isinstance(
                 attr,
                 (
@@ -36,6 +46,7 @@ def derived(_t):
                 )
         ):
             body[m] = functools.wraps(attr)(wrap(m))
+    # construct and return the type
     return type(name, bases, body)
 
 
@@ -132,6 +143,12 @@ class Iter(Group):
 
 class List(OrderedGroup, derived(list)):
     """A lightweight list class that provides extended map and filter syntax."""
+    def join(self, sep=''):
+        return Str(sep.join(self))
+
+class Str(derived(collections.UserString, {list:List})):
+    def print(self):
+        print(self)
 
 
 class Tuple(OrderedGroup, derived(tuple)):
