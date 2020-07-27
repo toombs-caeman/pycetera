@@ -1,58 +1,45 @@
-import collections
 import functools
 import unittest
-
 from inspect import signature
-from itertools import repeat
 
 
-def anomap(f):
+def decorator(wrapper):
     """
-    Decorated function will map itself over arguments when annotated types don't match.
-    if all annotations match it returns as written.
-    if one or more annotations don't match, it instead returns a map of results.
+    Wrap function as a simple decorator.
+
+    Does not handle decorators that accept extra arguments
     """
-    sig = signature(f)
+    @functools.wraps(wrapper)
+    def dec(wrapped):
 
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        b = sig.bind(*args, **kwargs)
-        b.apply_defaults()
-        b = b.arguments
-        should_map = [type(b.get(k)) != v for k, v in f.__annotations__.items()]
-        if any(should_map):
-            return map(
-                f,
-                *map(
-                    lambda x, a: iter(a) if x else repeat(a),
-                    should_map,
-                    b.values(),
-                )
-            )
-        return f(*args, **kwargs)
+        sig = signature(wrapped)
 
-    return wrapper
+        @functools.wraps(wrapped)
+        def bind_args(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            return wrapper(wrapped, *bound.args, **bound.kwargs)
 
-
-def singleton(*a, **kw):
-    def inner(klass):
-        return klass(*a, **kw)
-
-    return inner
-
-
-def return_namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
-    """wrap the return value of a function with collection.namedtuple"""
-    retType = collections.namedtuple(typename, field_names, rename=rename, defaults=defaults, module=module)
-
-    def dec(func):
-        @functools.wraps(func)
-        def wrapper(*a, **kw):
-            return retType(*func(*a, **kw))
-
-        return wrapper
+        return bind_args
 
     return dec
+
+
+class boundmethod:
+    """Method is bound to its class when not bound to an instance."""
+
+    def __init__(self, f):
+        self.__func__ = f
+
+    def __get__(self, obj, cls):
+        return functools.partial(self.__func__, cls if obj is None else obj)
+
+
+
+@decorator
+def trace(f, *args, **kwargs):
+    print("calling %s with args %s, %s" % (f.__name__, args, kwargs))
+    return f(*args, **kwargs)
 
 
 def static_vars(**kw):
@@ -65,7 +52,9 @@ def static_vars(**kw):
 
 
 class Doxception(Exception):
-    """Doxception prepends its docstring to its output"""
+    """
+    Doxception prepends its docstring to its output.
+    """
 
     def __init__(self, *args):
         super().__init__(" ".join((self.__doc__, *args)))
@@ -86,38 +75,7 @@ class TestDecorators(unittest.TestCase):
         self.assertEqual(counter(), 2)
         self.assertEqual(counter(), 3)
 
-    def test_anomap(self):
-        @anomap
-        def f(x: int, y: int):
-            return x + y
-
-        self.assertEqual(f(1, 3), 4)
-        self.assertEqual(list(f([3, 4], 1)), [4, 5])
-
-    def test_singleton(self):
-        littleL = [3, 5, 3]
-
-        @singleton(littleL)
-        class BigL(list):
-            pass
-
-        self.assertTrue(isinstance(BigL, list))
-        self.assertEqual(BigL, littleL)
-
-        @singleton()
-        def f():
-            return 3
-
-        self.assertEqual(f, 3)
-
-    def test_return_namedtuple(self):
-        @return_namedtuple("result", ("first", "second", "sum"))
-        def add(a, b):
-            return a, b, a + b
-
-        r = add(1, 3)
-        self.assertEqual(r.sum, 4)
-
 
 if __name__ == '__main__':
     unittest.main()
+
