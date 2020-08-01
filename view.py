@@ -1,5 +1,5 @@
-import collections
 import unittest
+import collections
 from abc import abstractmethod, ABC
 from operator import getitem, setitem, delitem
 
@@ -173,8 +173,11 @@ def view(**kwargs):
     Access a set of optics as members of an object.
     """
     T = collections.namedtuple('view', kwargs.keys())
-    # allow binding
-    T.__rrshift__ = lambda s, o: type(s)(*(o >> x for x in s))
+    T.__rrshift__=lambda s, o: type(
+        'bound_view',
+        (),
+        {k:o>>v for k,v in s._asdict().items()},
+    )()
     return T(*kwargs.values())
 
 
@@ -272,11 +275,9 @@ class TestOptic(unittest.TestCase):
         v = view(b=X['a'])
         self.assertEqual(1, v.b(d))
         v = d >> v  # bind v to d
-        # TODO this fails, descriptor not set up correctly?
         self.assertEqual(1, v.b)
         v.b = 3
         self.assertEqual(d, {'a':3})
-        print(d)  # {'a':3}
 
 
 if __name__ == '__main__':

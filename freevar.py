@@ -2,7 +2,6 @@ import functools
 import inspect
 import unittest
 
-from decorators import singleton
 from operator import *
 
 
@@ -26,7 +25,6 @@ class rpartial(functools.partial):
         return self.func(*args, *self.args, **newkeywords)
 
 
-@singleton()
 class X:
     """
     function composition interface
@@ -112,6 +110,7 @@ class X:
 
         return functools.reduce(apply, self.__queue, args)[0]
 
+X = X()
 
 class TestLambda(unittest.TestCase):
 

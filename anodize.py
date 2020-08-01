@@ -13,7 +13,7 @@ from collections import namedtuple
 
 # extended functions
 # see https://funcy.readthedocs.io/en/latest/extended_fns.html#extended-fns
-AnoCast = cast.cast()
+AnoCast = cast.Caster()
 AnoCast.register(lambda y: lambda x: x, type(None), Callable)
 AnoCast.register(lambda y: lambda x: y[x], Mapping, Callable)
 AnoCast.register(lambda y: lambda x: x in y, set, Callable)
