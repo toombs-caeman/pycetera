@@ -51,18 +51,6 @@ def static_vars(**kw):
     return wrapper
 
 
-class Doxception(Exception):
-    """
-    Doxception prepends its docstring to its output.
-    """
-
-    def __init__(self, *args):
-        super().__init__(" ".join((self.__doc__, *args)))
-
-
-class ExampleException(Doxception):
-    """It let's you write things like this."""
-
 
 class TestDecorators(unittest.TestCase):
     def test_static_vars(self):
