@@ -27,8 +27,6 @@ class Lens(tuple):
 X = Lens()
 
 
-All[:].expire._(end_date, True)(CIDR.objects....)
-
 class TestLens(unittest.TestCase):
     def setUp(self):
         class nonce(list):
