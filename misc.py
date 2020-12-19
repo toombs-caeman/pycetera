@@ -14,9 +14,19 @@ def zip(*iterables, fillvalue=no_fill):
 
 @wraps(map)
 def map(f, *i, fillvalue=no_fill):
+    if not i:
+        return partial(map, f, fillvalue=fillvalue)
     if fillvalue is no_fill:
-        return map(f, *i)
-    return map(lambda args: f(*args), zip_longest(*i, fillvalue=fillvalue))
+        return builtins.map(f, *i)
+    return builtins.map(lambda args: f(*args), zip_longest(*i, fillvalue=fillvalue))
+
+
+def compose(*functions):
+    return lambda obj: reduce(lambda o, f: f(o), reversed(functions), obj)
+
+
+def compose_with(*functions):
+    return partial(compose, *functions)
 
 
 class Doxception(Exception):

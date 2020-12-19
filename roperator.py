@@ -1,4 +1,3 @@
-import itertools
 from operator import *
 
 

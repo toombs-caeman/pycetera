@@ -61,7 +61,10 @@ class Group:
             return type(self)(map(lambda x: self[x], item))
         if callable(item):
             return type(self)(filter(item, self))
-        raise TypeError("couldn't filter on " + str(item))
+        get = getattr(super(), '__getitem__', None)
+        if get:
+            return get(item)
+        raise TypeError("couldn't filter on " + repr(item))
 
     # FUNCTOOLS/ITERTOOLS SUGAR
     @functools.wraps(functools.reduce)

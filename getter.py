@@ -90,6 +90,20 @@ class Lens(tuple):
 
 X = Lens()
 
+getter =type("", (), {
+    "__call__": lambda s, o:o,
+    "__getattr__": lambda s, x: type("",(type(s),), {"__call__":lambda s,o:getattr(super(type(s),s).__call__(o), x)})(),
+    "__getitem__": lambda s, x: type("", (type(s),), {"__call__": lambda s, o: super(type(s),s).__call__(o)[x]})(),
+})()
+class getter:
+    def __call__(self, o):
+        return o
+    def __getattr__(self, item):
+        return type("getter", (type(self),), {"__call__":lambda s,o:getattr(super(type(s),s).__call__(o), item)})()
+    def __getitem__(self, item):
+        return type("getter", (type(self),), {"__call__":lambda s,o:super(type(s),s).__call__(o)[item]})()
+getter = getter()
+
 class TestLens(unittest.TestCase):
     def setUp(self):
         class nonce(list):

@@ -17,7 +17,6 @@ _delete = object()
 
 _get_op = (getattr, getitem, setattr, setitem, delattr, delitem)
 
-
 class Optic(tuple, ABC):
     def __new__(cls, *args):
         return tuple.__new__(cls, args)
