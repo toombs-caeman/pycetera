@@ -1,30 +1,17 @@
+import logging
 import unittest
 import collections
 import datetime
 import sqlite3 as sql
 from functools import lru_cache
 
-"""
-the Worst Object-Relational Mapping (WORM)
+log = logging.getLogger(__name__)
+HAL = "I'm sorry Dave, I'm afraid I can't do that."
 
-"works" with a sqlite backend
-
-TODO
-* fix up default value handling. I'm inclined to handle it entirely python side
-    since sqlite3's converter/adapter handling is attrocious.
-* wrap/fix up converter/adapter/TYPES handling
-"""
 
 def explain(query, params):
     return query.replace("?", "{!r}").format(*params)
 
-
-class Row(sql.Row):
-    def __getattr__(self, item):
-        return self[item]
-
-    __repr__ = tuple.__repr__
-    __str__ = tuple.__str__
 
 ### TYPE HANDLING ###
 TYPES = {
@@ -43,6 +30,9 @@ def register_type(sql_name, python_cls):
     TYPES[sql_name] = python_cls
     TYPES[python_cls] = sql_name
 
+class Row(sql.Row):
+    def __getattr__(self, item):
+        return self[item]
 
 ### END TYPE HANLDING ###
 
@@ -58,6 +48,7 @@ class Database:
             **kwargs,
         }
         with self.conn as conn:
+            log.info("checking db '%s'...", database)
             for model in self.all_models:
                 # give the model this db so that they can create connections
                 model._db = self
@@ -70,7 +61,9 @@ class Database:
                 # if the table doesn't exist then create it
                 if not columns:
                     # create table from model
+                    log.info(f"creating table '%s'...", model.__name__)
                     conn.execute(*model._render)
+                    print(conn.execute(f"pragma table_info({model.__name__})").fetchall())
                     continue
 
                 # make sure the schema matches what we've got in python
@@ -84,6 +77,7 @@ class Database:
                     # TODO set needs_migration if col flags don't match
 
                 if needs_migration:
+                    log.warning("migrating table '%s'...", model.__name__)
                     # move the table to temporary location
                     conn.execute(f"alter table {model.__name__} rename to {model.__name__}_old")
                     # recreate the table
@@ -96,8 +90,11 @@ class Database:
                 for field in model._fields:
                     if field.name in column_names:
                         continue
-                    # TODO
+                    log.info("adding field '%s' to table '%s'", field.name, model.__name__)
                     self.add_column(model, field)
+            conn.commit()
+
+        log.info("%s ok", database)
 
     def add_column(self, model, field):
         raise NotImplementedError
@@ -126,6 +123,7 @@ SetDefault = "set default"
 Cascade = "cascade"
 
 
+# TODO python>=3.8 can be greatly simplified by namedtuple having 'default' parameter
 class F(collections.namedtuple(
     "Field",
     (
@@ -200,63 +198,135 @@ class _model_meta(type):
     # decorators can be replaced by @functools.cached_property when sys.version >= 3.8
     @property
     @lru_cache(maxsize=None)
-    def _type(cls):
-        return type(
-            cls.__name__,
-            (sql.Row,),
-            {
-                "_save": lambda s: cls[cls.id == s.id].update(**s),
-                "_delete": lambda s: cls[cls.id == s.id].delete(),
-            }
-        )
+    def row(model):
+        def delete(row):
+            # TODO
+            raise NotImplementedError
+
+        def save(row):
+            # TODO
+            raise NotImplementedError
+
+        def get_field(row, field_id):
+            value = row[field_id]
+            # handle foreign keys
+            fk = model._fields[field_id]
+            if issubclass(fk.type, Model):
+                return fk.type.get(id=value)
+            return value
+
+        def set_field(row, field_id, value):
+            # handle foreign keys
+            fk = model._fields[field_id]
+            if issubclass(fk.type, Model) and isinstance(value, fk.type.row):
+                value = value.id
+
+            row[field_id] = value
+
+        return type(model.__name__ + ".row", (list,), dict({
+            field.name: (lambda i: property(lambda s: get_field(s, i), lambda s, v: set_field(s, i, v)))(i)
+            for i, field in enumerate(model._fields)
+        }, save=save, delete=delete))
+
 
     @property
     def _render(cls):
         f, d = zip(*(f._render for f in cls._fields))
         return f"create table {cls.__name__} ({', '.join(f)});", tuple(x for i in d for x in i)
 
+    @property
+    def _conn(cls):
+        conn = cls._db.conn
+        conn.row_factory = lambda c, r:cls.row(r)
+        return conn
+
+
+
+
+
+
 
 class Model(object, metaclass=_model_meta):
     """
-    A base class representing a queryset/model.
+    A base class representing a queryset/instance.
 
     The class itself has meta-data of the table.
     an instance has information to construct a query.
     """
     id = F(int, primary_key=True)
 
-    # internal data
-    _db = None
+    def __init__(self, **filters):
+        self.filters = filters
 
-    def __init__(self, action="select"):
-        pass
+    def __call__(self, **filters):
+        return type(self)(**self.filters, **filters)
 
     @property
     def _render(self):
-        return f"select id, * from {self.__name__} where {' and '.join(self.where)}"
-        pass
+        # render where clause
+        lookups = {
+            "eq": "=",
+            "gt": ">",
+            "lt": "<",
+            "ge": ">=",
+            "le": "<=",
+            "ne": "<>",
+        }
+        clauses = []
+        for f in self.filters:
+            field, *lookup = f.split("__")
+            clauses.append(" ".join((field, *(lookups[l] for l in lookup or ["eq"]),"?")))
+
+        # final render
+        return f"select * from {type(self).__name__} where {' and '.join(clauses) or 1}", tuple(self.filters.values())
 
     def __iter__(self):
-        return self._db.conn.execute(*self._render)
+        return type(self)._conn.execute(*self._render)
 
-    def _values(self, *fields):
-        """return a model with additional clauses"""
-
-    def _filter(self, **kwargs):
-        """return a model with additional clauses"""
-
-    def _get(self, **kwargs):
-        """return a single Row or raise an exception."""
-        return iter(self).fetchone()
-
-    def get_or_create(self, **kwargs):
-        """return a single Row or raise an exception."""
-
-    def update(self, **kwargs):
-        """return a count of updated objects."""
-
+    def all(self):
+        return iter(self).fetchall()
     def delete(self):
         """return a count of deleted objects."""
+        raise NotImplementedError
+
+    def update(self, **fields):
+        """return a count of updated objects."""
+        T = type(self)
+        return (
+            f"insert into {T.__name__} values ({', '.join(['?'] * len(T._fields))})",
+            [getattr(self, f.name) for f in T._fields]
+        )
+
+    def get(self, **filters):
+        """
+        fetch a single row if it exists.
+
+        filters with a lookup are ignored (including '__eq') but others are used as field values.
+        """
+        """return a single Row or raise an exception."""
+        items = iter(self(**filters) if filters else self).fetchmany(2)
+        if len(items) != 1:
+            # TODO better error here?
+            raise sql.ProgrammingError
+        return items[0]
+
+    def create(self, **filters):
+        """
+
+        """
+        new = type(self).new(
+            **{
+                k:v
+                for k,v in {**self.filters, **filters}.items()
+                if not k.contains("__")
+            }
+        )
+        new.save()
+        return new
+
+    def get_or_create(self, **filters):
+        return self.get(**filters) or self.create(**filters)
+
 
 ### END MODEL ###
 
@@ -305,6 +375,8 @@ class TestCase(unittest.TestCase):
     def test_select(self):
         class Artist(Model):
             first_name = last_name = F(str)
+
+        Database(self.db)
 
 
 if __name__ == '__main__':
