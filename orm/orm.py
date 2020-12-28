@@ -1,12 +1,35 @@
 import logging
 import unittest
-import collections
 import datetime
 import sqlite3 as sql
 from functools import lru_cache
 
 log = logging.getLogger(__name__)
 HAL = "I'm sorry Dave, I'm afraid I can't do that."
+
+def record(names, defaults=()):
+    """Like collections.namedtuple but mutable."""
+    class _:
+        def __init__(self, *args, **kwargs):
+            # names are resolved first in kwargs, then args, then defaults
+            args = list(args[::-1])
+            object.__setattr__(
+                self, "__fields",
+                {
+                    n: kwargs.get(n, args.pop() if args else defaults[i - len(names)])
+                    for i, n in enumerate(names)
+                },
+            )
+
+        def __iter__(self):
+            return iter(self.__fields.values())
+
+        def __getattr__(self, item):
+            return self.__fields[item]
+
+        def __repr__(self):
+            return repr(self.__fields)
+    return _
 
 
 def explain(query, params):
@@ -49,7 +72,11 @@ class Database:
         }
         with self.conn as conn:
             log.info("checking db '%s'...", database)
-            for model in self.all_models:
+            for model in Model.__subclasses__():
+                # models that start with '_' are considered abstract
+                if model.__name__.startswith('_'): continue
+
+                log.info("checking model '%s'...", model.__name__)
                 # give the model this db so that they can create connections
                 model._db = self
 
@@ -63,7 +90,6 @@ class Database:
                     # create table from model
                     log.info(f"creating table '%s'...", model.__name__)
                     conn.execute(*model._render)
-                    print(conn.execute(f"pragma table_info({model.__name__})").fetchall())
                     continue
 
                 # make sure the schema matches what we've got in python
@@ -92,7 +118,6 @@ class Database:
                         continue
                     log.info("adding field '%s' to table '%s'", field.name, model.__name__)
                     self.add_column(model, field)
-            conn.commit()
 
         log.info("%s ok", database)
 
@@ -106,13 +131,6 @@ class Database:
         conn.execute("pragma foreign_key = 1")
         return conn
 
-    @property
-    def all_models(self):
-        for model in Model.__subclasses__():
-            # models that start with '_' are considered abstract
-            if model.__name__.startswith('_'): continue
-            yield model
-
 
 ### FIELD ###
 
@@ -124,42 +142,16 @@ Cascade = "cascade"
 
 
 # TODO python>=3.8 can be greatly simplified by namedtuple having 'default' parameter
-class F(collections.namedtuple(
-    "Field",
-    (
-            "type", "default", "primary_key", "not_null",
-            # foreign key fields
-            "on_delete", "on_update",
-            # generated exression
-            "generate", "stored",
-            "name",
+class F(
+    record(
+        ["type", "default", "primary_key", "not_null", "on_delete", "on_update", "generate", "stored", "name"],
+        [             None,         False,      False,          "",          "",         "",    False,   None],
     )
-)):
-
-    def __new__(
-            cls,
-            type, default=None, primary_key=False, not_null=False,
-            *,
-            on_delete="", on_update="",
-            generate="", stored=False,
-            name=None,
-    ):
-        return super().__new__(
-            cls, type, default, primary_key, not_null, on_delete, on_update, generate, stored, name
-        )
-
+):
     @property
     def _render(self):
         """Return field definition"""
-        out = ""
-        if issubclass(self.type, Model):
-            out += f'foreign key ({self.name}) references {self.type.__name__}(id)'
-            if self.on_update:
-                out += f' on update {self.on_update}'
-            if self.on_delete:
-                out += f' on delete {self.on_delete}'
-        else:
-            out += f'{self.name} {TYPES.get(self.type, self.type.__name__)}'
+        out = f'{self.name} {TYPES.get(self.type, self.type.__name__)}'
 
         if self.not_null:
             out += ' not null'
@@ -176,8 +168,13 @@ class F(collections.namedtuple(
             def_string = sql.adapters.get((t, sql.PrepareProtocol), str)(self.default)
             out += f" default ('{def_string}')"
 
+        if issubclass(self.type, Model):
+            out += f', foreign key ({self.name}) references {self.type.__name__}(id)'
+            if self.on_update:
+                out += f' on update {self.on_update}'
+            if self.on_delete:
+                out += f' on delete {self.on_delete}'
         return out, ()
-
 
 ### END FIELD ###
 
@@ -188,45 +185,47 @@ class _model_meta(type):
     @lru_cache(maxsize=None)
     def _fields(cls):
         fields = []
-        for k, v in cls.__dict__.items():
+        # use dict comprehension to de-duplicate keys
+        # don't use dir b/c we don't want to sort keys
+        for k, v in {k:v for scls in reversed(cls.__mro__) for k, v in scls.__dict__.items()}.items():
             if isinstance(v, F):
-                v = v._replace(name=k)
-                setattr(cls, k, v)
-                fields.append(v)
+                fields.append(F(*v, name=k))
+                setattr(cls, k, fields[-1])
         return tuple(fields)
 
     # decorators can be replaced by @functools.cached_property when sys.version >= 3.8
     @property
     @lru_cache(maxsize=None)
     def row(model):
-        def delete(row):
-            # TODO
-            raise NotImplementedError
+        class _(record(*zip(*((f.name, f.default) for f in model._fields)))):
+            def __getattr__(self, item):
+                value = self.__fields[item]
+                # handle foreign keys
+                fk = getattr(model, item)
+                if issubclass(fk.type, Model):
+                    return fk.type.get(id=value)
+                return value
 
-        def save(row):
-            # TODO
-            raise NotImplementedError
+            def __setattr__(self, key, value):
+                # handle foreign keys
+                fk = getattr(model, key, None)
+                if fk and issubclass(fk.type, Model) and isinstance(value, fk.type.row):
+                    value = value.id
 
-        def get_field(row, field_id):
-            value = row[field_id]
-            # handle foreign keys
-            fk = model._fields[field_id]
-            if issubclass(fk.type, Model):
-                return fk.type.get(id=value)
-            return value
+                self.__fields[key] = value
 
-        def set_field(row, field_id, value):
-            # handle foreign keys
-            fk = model._fields[field_id]
-            if issubclass(fk.type, Model) and isinstance(value, fk.type.row):
-                value = value.id
+            def delete(self):
+                # TODO
+                raise NotImplementedError
 
-            row[field_id] = value
+            def save(self):
+                render = f"insert into {model.__name__} values ({', '.join(f':{f.name}' for f in model._fields)})"
+                # TODO inserting all into the first field??
+                with model._conn as conn:
+                    conn.execute(render, self.__fields)
 
-        return type(model.__name__ + ".row", (list,), dict({
-            field.name: (lambda i: property(lambda s: get_field(s, i), lambda s, v: set_field(s, i, v)))(i)
-            for i, field in enumerate(model._fields)
-        }, save=save, delete=delete))
+        _.__name__ = model.__name__ + "_row"
+        return _
 
 
     @property
@@ -237,7 +236,7 @@ class _model_meta(type):
     @property
     def _conn(cls):
         conn = cls._db.conn
-        conn.row_factory = lambda c, r:cls.row(r)
+        conn.row_factory = lambda c, r:cls.row(*r)
         return conn
 
 
@@ -253,7 +252,7 @@ class Model(object, metaclass=_model_meta):
     The class itself has meta-data of the table.
     an instance has information to construct a query.
     """
-    id = F(int, primary_key=True)
+    id = F(int, primary_key=True, not_null=True)
 
     def __init__(self, **filters):
         self.filters = filters
@@ -358,16 +357,19 @@ class TestCase(unittest.TestCase):
 
         db = Database(self.db)
         self.assertEqual(
-            ("create table Artist (first_name text default ('NA'), "
+            ("create table Artist ("
+             "id integer not null primary key, "
+             "first_name text default ('NA'), "
              "last_name text default ('NA'), "
              "birthday date not null default ('1000-01-01'));", ()),
             Artist._render,
         )
         self.assertEqual(
             [
-                (0, 'first_name', 'text', 0, repr(na), 0),
-                (1, 'last_name', 'text', 0, repr(na), 0),
-                (2, 'birthday', 'date', 1, "'1000-01-01'", 0),
+                (0, 'id', 'integer', 1, None, 1),
+                (1, 'first_name', 'text', 0, repr(na), 0),
+                (2, 'last_name', 'text', 0, repr(na), 0),
+                (3, 'birthday', 'date', 1, "'1000-01-01'", 0),
             ],
             [tuple(r) for r in db.conn.execute("pragma table_info(artist)").fetchall()],
         )
