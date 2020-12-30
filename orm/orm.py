@@ -5,90 +5,60 @@ import sqlite3 as sql
 from functools import lru_cache
 
 log = logging.getLogger(__name__)
-HAL = "I'm sorry Dave, I'm afraid I can't do that."
+# Foreign key flags
+Restrict = "restrict"
+SetNull = "set null"
+SetDefault = "set default"
+Cascade = "cascade"
 
-def record(names, defaults=()):
-    """Like collections.namedtuple but mutable."""
-    class _:
-        def __init__(self, *args, **kwargs):
-            # names are resolved first in kwargs, then args, then defaults
-            args = list(args[::-1])
-            object.__setattr__(
-                self, "__fields",
-                {
-                    n: kwargs.get(n, args.pop() if args else defaults[i - len(names)])
-                    for i, n in enumerate(names)
-                },
-            )
 
-        def __iter__(self):
-            return iter(self.__fields.values())
-
+class Database:
+    class Row(sql.Row):
         def __getattr__(self, item):
-            return self.__fields[item]
+            return self[item]
 
         def __repr__(self):
-            return repr(self.__fields)
-    return _
+            return repr((*self,))
 
-
-def explain(query, params):
-    return query.replace("?", "{!r}").format(*params)
-
-
-### TYPE HANDLING ###
-TYPES = {
-    "null": None,
-    "integer": int,
-    "real": float,
-    "text": str,
-    "blob": bytes,
-    "date": datetime.date,
-    "timestamp": datetime.datetime,
-}
-TYPES.update({v: k for k, v in TYPES.items()})
-
-
-def register_type(sql_name, python_cls):
-    TYPES[sql_name] = python_cls
-    TYPES[python_cls] = sql_name
-
-class Row(sql.Row):
-    def __getattr__(self, item):
-        return self[item]
-
-### END TYPE HANLDING ###
-
-### DATABASE ###
-class Database:
-    """
-    A time-series semi-ORM inspired by django
-    """
+    @property
+    def conn(self):
+        conn = sql.connect(**self._options)
+        conn.row_factory = self.Row
+        conn.execute("pragma foreign_key = 1")
+        return conn
 
     def __init__(self, database=':memory:', **kwargs):
-        self._options = {
-            "database": database,
-            **kwargs,
-        }
+        self._options = {"database": database, "detect_types": sql.PARSE_DECLTYPES, **kwargs}
+
         with self.conn as conn:
-            log.info("checking db '%s'...", database)
+            log.info("initializing db '%s'...", database)
+            all_models = {}
+
+            # check definitions
             for model in Model.__subclasses__():
                 # models that start with '_' are considered abstract
-                if model.__name__.startswith('_'): continue
+                if model.__name__.startswith('_'):
+                    continue
+                if model.__name__ in all_models:
+                    msg = "duplicate definitions found for model '%s' in %s and %s" % (
+                        model.__name__,
+                        model.__module__,
+                        all_models[model.__name__].__module__,
+                    )
+                    log.critical(msg)
+                    raise ImportError(msg)
+                all_models[model.__name__] = model
 
-                log.info("checking model '%s'...", model.__name__)
-                # give the model this db so that they can create connections
+            for model in all_models.values():
                 model._db = self
 
                 field_names = [f.name for f in model._fields]
-
-                columns = conn.execute(f"pragma table_info({model.__name__})").fetchall()
+                columns = conn.execute(f"pragma table_info({model})").fetchall()
                 column_names = [c.name for c in columns]
 
                 # if the table doesn't exist then create it
                 if not columns:
-                    # create table from model
-                    log.info(f"creating table '%s'...", model.__name__)
+                    log.info(explain(*model._render))
                     conn.execute(*model._render)
                     continue
 
@@ -103,83 +73,148 @@ class Database:
                     # TODO set needs_migration if col flags don't match
 
                 if needs_migration:
-                    log.warning("migrating table '%s'...", model.__name__)
+                    log.warning("migrating table '%s'...", model)
+                    raise NotImplementedError
                     # move the table to temporary location
-                    conn.execute(f"alter table {model.__name__} rename to {model.__name__}_old")
+                    conn.execute(f"alter table {model} rename to {model}_old")
                     # recreate the table
                     conn.execute(*model._render)
                     # TODO move all the data
-                    conn.execute(f"drop table {model.__name__}_old")
+                    conn.execute(f"drop table {model}_old")
                     continue
 
                 # if the field doesn't have a matching column it needs to be added
                 for field in model._fields:
                     if field.name in column_names:
                         continue
-                    log.info("adding field '%s' to table '%s'", field.name, model.__name__)
-                    self.add_column(model, field)
+                    log.info("adding field '%s' to table '%s'", field.name, model)
+                    raise NotImplementedError
 
         log.info("%s ok", database)
 
-    def add_column(self, model, field):
-        raise NotImplementedError
 
-    @property
-    def conn(self):
-        conn = sql.connect(**self._options)
-        conn.row_factory = Row
-        conn.execute("pragma foreign_key = 1")
-        return conn
-
-
-### FIELD ###
-
-# Foreign key flags
-Restrict = "restrict"
-SetNull = "set null"
-SetDefault = "set default"
-Cascade = "cascade"
+def explain(query, params):
+    """Render a sql query"""
+    if isinstance(params, dict):
+        for k, v in params.items():
+            query = query.replace(f':{k}', repr(v))
+        return query
+    return query.replace("?", "{!r}").format(*params)
 
 
-# TODO python>=3.8 can be greatly simplified by namedtuple having 'default' parameter
-class F(
-    record(
-        ["type", "default", "primary_key", "not_null", "on_delete", "on_update", "generate", "stored", "name"],
-        [             None,         False,      False,          "",          "",         "",    False,   None],
+def format_params(*args, **kwargs):
+    j = ', '.join
+    return j((*j(map(repr, args)), j(f'{k}={v!r}' for k, v in kwargs.items())))
+
+
+def clean_dict(d):
+    return {k: v.id if isinstance(v, _model_row) else v for k, v in d.items()}
+
+
+def _named_list(*names, **defaults):
+    """
+    Like collections.namedtuple but mutable.
+
+    Internally it is really a dict() which makes use of the fact that they are guaranteed insertion ordering.
+    """
+    names = (*names, *defaults)
+
+    class _:
+        def __init__(self, *args, **kwargs):
+            args = list(reversed(args))
+            object.__setattr__(self, "_fields", {})
+            try:
+                for n in names:
+                    setattr(self, n, kwargs.pop(n) if n in kwargs else args.pop() if args else defaults[n])
+            except KeyError:
+                raise TypeError(f"Not enough arguments passed to {type(self)}.")
+            if args or kwargs:
+                raise TypeError(f"Extra arguments passed to {type(self)} ({format_params(*args, **kwargs)}).")
+
+        def __iter__(self):
+            return iter(self._fields.values())
+
+        def __getattr__(self, item):
+            return self._fields[item]
+
+        def __setattr__(self, key, value):
+            self._fields[key] = value
+
+        def __eq__(self, other):
+            return type(self) is type(other) and all(s == o for s, o in zip(self, other))
+
+        def __ne__(self, other):
+            return not self == other
+
+        def _replace(self, **kwargs):
+            return type(self)(**{**self._fields, **kwargs})
+
+        def __repr__(self):
+            return repr(self._fields)
+
+    _.__name__ = "namedlist"
+    return _
+
+
+class Type:
+    _types = {
+        type(None): "NULL", int: "INTEGER", float: "REAL", str: "TEXT", bytes: "BLOB",
+        datetime.date: "DATE", datetime.datetime: "TIMESTAMP",
+    }
+
+    @classmethod
+    def register(cls, type, typename, converter, adapter):
+        """
+        register a new database type
+        converter(bytes) -> object
+        adapter(object) -> str, bytes, int, or float
+        """
+        cls._types[type] = typename
+        sql.register_converter(typename, converter)
+        sql.register_adapter(type, adapter)
+
+    @classmethod
+    def get_typename(cls, t):
+        return f'INTEGER REFERENCES {t}' if issubclass(t, Model) else cls._types.get(t, cls._types[bytes])
+
+    @classmethod
+    def adapt(cls, o):
+        # run any adapters, but not any converters, since it doesn't know how to convert the column
+        return sql.connect(':memory:').execute('select ?', (o,)).fetchone()[0]
+
+
+class Field(
+    _named_list(
+        "type",
+        default=None, primary_key=False, not_null=False, on_delete="", on_update="", generate="", stored=False, name=""
     )
 ):
     @property
     def _render(self):
-        """Return field definition"""
-        out = f'{self.name} {TYPES.get(self.type, self.type.__name__)}'
+        return " ".join(
+            value for condition, value in zip(
+                (
+                    self.name, self.type, self.on_delete, self.on_update, self.default,
+                    self.primary_key, self.not_null, self.generate, self.stored
+                ),
+                (
+                    self.name, Type.get_typename(self.type),
+                    f'ON DELETE {self.on_delete}', f'ON UPDATE {self.on_update}',
+                    f"DEFAULT ({Type.adapt(self.default)!r})",
+                    "PRIMARY KEY", "NOT NULL", f'AS {self.generate}', "STORED",
+                )
+            ) if condition
+        ), ()
 
-        if self.not_null:
-            out += ' not null'
 
-        if self.primary_key:
-            out += ' primary key'
+class _model_row:
+    pass
 
-        if self.generate:
-            out += f' as {self.generate}'
-            if self.stored:
-                out += ' stored'
-        elif self.default is not None:
-            t = type(self.default)
-            def_string = sql.adapters.get((t, sql.PrepareProtocol), str)(self.default)
-            out += f" default ('{def_string}')"
 
-        if issubclass(self.type, Model):
-            out += f', foreign key ({self.name}) references {self.type.__name__}(id)'
-            if self.on_update:
-                out += f' on update {self.on_update}'
-            if self.on_delete:
-                out += f' on delete {self.on_delete}'
-        return out, ()
-
-### END FIELD ###
-
-### MODEL ###
 class _model_meta(type):
+    def __str__(self):
+        return self.__name__
+
     # decorators can be replaced by @functools.cached_property when sys.version >= 3.8
     @property
     @lru_cache(maxsize=None)
@@ -187,9 +222,10 @@ class _model_meta(type):
         fields = []
         # use dict comprehension to de-duplicate keys
         # don't use dir b/c we don't want to sort keys
-        for k, v in {k:v for scls in reversed(cls.__mro__) for k, v in scls.__dict__.items()}.items():
-            if isinstance(v, F):
-                fields.append(F(*v, name=k))
+        # TODO I don't think this allows overriding fields
+        for k, v in {k: v for scls in cls.__mro__ for k, v in scls.__dict__.items()}.items():
+            if isinstance(v, Field):
+                fields.append(v._replace(name=k))
                 setattr(cls, k, fields[-1])
         return tuple(fields)
 
@@ -197,52 +233,59 @@ class _model_meta(type):
     @property
     @lru_cache(maxsize=None)
     def row(model):
-        class _(record(*zip(*((f.name, f.default) for f in model._fields)))):
+        class model_row(_named_list(**{f.name: f.default for f in model._fields}), _model_row):
             def __getattr__(self, item):
-                value = self.__fields[item]
+                value = self._fields[item]
                 # handle foreign keys
                 fk = getattr(model, item)
-                if issubclass(fk.type, Model):
-                    return fk.type.get(id=value)
+                if isinstance(value, int) and issubclass(fk.type, Model):
+                    self._fields[item] = fk.type.get(id=value)
+                    return self._fields[item]
                 return value
 
-            def __setattr__(self, key, value):
-                # handle foreign keys
-                fk = getattr(model, key, None)
-                if fk and issubclass(fk.type, Model) and isinstance(value, fk.type.row):
-                    value = value.id
-
-                self.__fields[key] = value
-
             def delete(self):
-                # TODO
-                raise NotImplementedError
+                if self.id:
+                    render = f'DELETE FROM {model} WHERE id = :id'
+                    with model._conn as conn:
+                        log.info(explain(render, self._fields))
+                        conn.execute(render, self._fields)
+                    self.id = None
+                    return True
+                return False
 
             def save(self):
-                render = f"insert into {model.__name__} values ({', '.join(f':{f.name}' for f in model._fields)})"
-                # TODO inserting all into the first field??
+                render = (
+                    f"INSERT INTO {model} VALUES ({', '.join(f':{f.name}' for f in model._fields)}) "
+                    f"ON CONFLICT(id) DO UPDATE SET {', '.join(f'{f.name}=:{f.name}' for f in model._fields)} "
+                    f"WHERE id=:id"
+                )
                 with model._conn as conn:
-                    conn.execute(render, self.__fields)
+                    log.info(explain(render, clean_dict(self._fields)))
+                    self.id = conn.execute(render, clean_dict(self._fields)).lastrowid
+                return self
 
-        _.__name__ = model.__name__ + "_row"
-        return _
+            def __eq__(self, other):
+                # a row is also considered equal to its id
+                return isinstance(other, int) and self.id == other or super().__eq__(other)
 
+        model_row.__name__ = model.__name__ + "_row"
+        return model_row
 
     @property
     def _render(cls):
         f, d = zip(*(f._render for f in cls._fields))
-        return f"create table {cls.__name__} ({', '.join(f)});", tuple(x for i in d for x in i)
+        return f"CREATE TABLE {cls} ({', '.join(f)});", tuple(x for i in d for x in i)
 
     @property
+    @lru_cache(maxsize=None)
     def _conn(cls):
         conn = cls._db.conn
-        conn.row_factory = lambda c, r:cls.row(*r)
+        conn.row_factory = lambda c, r: cls.row(*r)
         return conn
 
-
-
-
-
+    @property
+    def get(cls):
+        return cls().get
 
 
 class Model(object, metaclass=_model_meta):
@@ -252,7 +295,7 @@ class Model(object, metaclass=_model_meta):
     The class itself has meta-data of the table.
     an instance has information to construct a query.
     """
-    id = F(int, primary_key=True, not_null=True)
+    id = Field(int, primary_key=True, not_null=True)
 
     def __init__(self, **filters):
         self.filters = filters
@@ -260,30 +303,55 @@ class Model(object, metaclass=_model_meta):
     def __call__(self, **filters):
         return type(self)(**self.filters, **filters)
 
+    def __str__(self):
+        return explain(*self._render)
+
     @property
     def _render(self):
         # render where clause
-        lookups = {
+        cmp = {
             "eq": "=",
             "gt": ">",
             "lt": "<",
             "ge": ">=",
             "le": "<=",
             "ne": "<>",
+            "in": "in",
         }
         clauses = []
-        for f in self.filters:
-            field, *lookup = f.split("__")
-            clauses.append(" ".join((field, *(lookups[l] for l in lookup or ["eq"]),"?")))
+        # lh, table,
+        for filter, value in clean_dict(self.filters).items():
+            # Album(artist__first_name__ne="joe")
+            # select * from album where artist in (select id from artist where first_name <> "joe")
+            # Song(album__artist__birthday__gt="date")
+            # select * from song where album in (select id from album where artist in (select id from artist where birthday > "date"))
+            clause = "{}"
+            subq = "{} IN (SELECT id FROM {} WHERE {})"
+            model = type(self)
+            fields = filter.split("__")[::-1]
+            op = cmp[fields.pop(0)] if fields[0] in cmp else "="
+            # get
+            while len(fields) > 1:
+                field = fields.pop()
+                model = getattr(model, field).type
+                clause = clause.format(subq).format(field, model, "{}")
+            clauses.append(clause.format(f'{fields.pop()} {op} :{filter}'))
 
         # final render
-        return f"select * from {type(self).__name__} where {' and '.join(clauses) or 1}", tuple(self.filters.values())
+        return f"SELECT * FROM {type(self)} WHERE {' AND '.join(clauses) or 1}", clean_dict(self.filters)
 
     def __iter__(self):
         return type(self)._conn.execute(*self._render)
 
     def all(self):
         return iter(self).fetchall()
+
+    def first(self):
+        return iter(self).fetchone()
+
+    def last(self):
+        raise NotImplemented
+
     def delete(self):
         """return a count of deleted objects."""
         raise NotImplementedError
@@ -292,7 +360,7 @@ class Model(object, metaclass=_model_meta):
         """return a count of updated objects."""
         T = type(self)
         return (
-            f"insert into {T.__name__} values ({', '.join(['?'] * len(T._fields))})",
+            f"insert into {T} values ({', '.join(['?'] * len(T._fields))})",
             [getattr(self, f.name) for f in T._fields]
         )
 
@@ -302,83 +370,159 @@ class Model(object, metaclass=_model_meta):
 
         filters with a lookup are ignored (including '__eq') but others are used as field values.
         """
-        """return a single Row or raise an exception."""
         items = iter(self(**filters) if filters else self).fetchmany(2)
-        if len(items) != 1:
-            # TODO better error here?
-            raise sql.ProgrammingError
+        if len(items) != 1: raise ValueError("Multiple objects returned")
         return items[0]
 
     def create(self, **filters):
-        """
-
-        """
-        new = type(self).new(
-            **{
-                k:v
-                for k,v in {**self.filters, **filters}.items()
-                if not k.contains("__")
-            }
-        )
-        new.save()
-        return new
+        # ignore fields with lookups
+        return type(self).row(**{k: v for k, v in {**self.filters, **filters}.items() if not k.contains("__")}).save()
 
     def get_or_create(self, **filters):
         return self.get(**filters) or self.create(**filters)
 
 
-### END MODEL ###
-
 class TestCase(unittest.TestCase):
+    """Base """
     db = "test.db"
 
     def setUp(self):
+        """Drop all tables before each test"""
         with sql.connect(self.db) as conn:
-            for r in conn.execute("select name from sqlite_master where type='table'"):
+            for r in conn.execute("select name from sqlite_master where type='table'").fetchall():
                 conn.execute(f"drop table {r[0]}")
 
-    def test_render_field(self):
-        self.assertEqual(
-            ("name text", ()),
-            F(str, name="name")._render,
-        )
+    def initDatabase(self):
+        return Database(self.db)
 
-        self.assertEqual(
-            ("name text not null default ('bruh')", ()),
-            F(str, name="name", default='bruh', not_null=True)._render,
-        )
 
-    def test_render_model(self):
-        na = "NA"
+class ORMTestCase(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        logging.basicConfig(level=logging.WARNING)
 
         class Artist(Model):
-            first_name = last_name = F(str, na)
-            birthday = F(datetime.date, datetime.date(1000, 1, 1), not_null=True)
+            first_name = last_name = Field(str, "NA")
+            birthday = Field(datetime.date, datetime.date(1000, 1, 1), not_null=True)
 
-        db = Database(self.db)
+        class Album(Model):
+            artist = Field(Artist, not_null=True)
+            title = Field(str, not_null=True)
+
+        cls.artist = Artist
+        cls.album = Album
+
+    def test_namedlist(self):
+        T = _named_list("a", "b", c=3, d=4)
+        # test that arguments are correctly counted
+        self.assertRaises(TypeError, T)
+        self.assertRaises(TypeError, T, 1, 2, 3, 4, 5)
+        self.assertRaises(TypeError, T, 2, 3, 4, 5, a=1)
+        self.assertEqual([1, 2, 3, 4], [*T(1, 2)])
+        self.assertEqual([1, 2, 3, 4], [*T(2, a=1)])
+
+    def test_render(self):
+        # field
+        self.assertEqual(("name TEXT", ()), Field(str, name="name")._render)
         self.assertEqual(
-            ("create table Artist ("
-             "id integer not null primary key, "
-             "first_name text default ('NA'), "
-             "last_name text default ('NA'), "
-             "birthday date not null default ('1000-01-01'));", ()),
-            Artist._render,
+            ("name TEXT DEFAULT ('bruh') NOT NULL", ()),
+            Field(str, name="name", default='bruh', not_null=True)._render,
         )
+        # table
+        self.assertEqual(
+            (f"CREATE TABLE {self.artist} ("
+             "first_name TEXT DEFAULT ('NA'), "
+             "last_name TEXT DEFAULT ('NA'), "
+             "birthday DATE DEFAULT ('1000-01-01') NOT NULL, "
+             "id INTEGER PRIMARY KEY NOT NULL);", ()),
+            self.artist._render,
+        )
+        db = self.initDatabase()
         self.assertEqual(
             [
-                (0, 'id', 'integer', 1, None, 1),
-                (1, 'first_name', 'text', 0, repr(na), 0),
-                (2, 'last_name', 'text', 0, repr(na), 0),
-                (3, 'birthday', 'date', 1, "'1000-01-01'", 0),
+                (0, 'first_name', 'TEXT', 0, repr("NA"), 0),
+                (1, 'last_name', 'TEXT', 0, repr("NA"), 0),
+                (2, 'birthday', 'DATE', 1, "'1000-01-01'", 0),
+                (3, 'id', 'INTEGER', 1, None, 1),
             ],
-            [tuple(r) for r in db.conn.execute("pragma table_info(artist)").fetchall()],
+            [tuple(r) for r in db.conn.execute(f"pragma table_info({self.artist})").fetchall()],
+        )
+        id = db.conn.execute(
+            "insert into artist(last_name) values ('Ni')"
+        ).execute(
+            "select * from artist where last_name ='Ni'"
+        ).fetchone()
+        self.assertEqual(
+            "NA",
+            id.first_name,
         )
 
     def test_select(self):
-        class Artist(Model):
-            first_name = last_name = F(str)
+        first_name = "Mario"
+        last_name = "Peach"
+        self.initDatabase()
+        self.artist.row(first_name, last_name).save()
+        self.assertEqual(
+            [f for f in self.artist.get(id=1)],
+            [first_name, last_name, datetime.date(year=1000, month=1, day=1), 1],
+        )
 
-        Database(self.db)
+    def test_row(self):
+        self.initDatabase()
+        r = self.artist.row("Mike", "Goldblum")
+
+        # insert
+        self.assertEqual(r.id, None)
+        r.save()
+        self.assertEqual(r.id, 1)
+
+        # update
+        r.first_name = "Jeff"
+        r.save()
+        self.assertEqual(r.id, 1)
+        self.assertEqual(len(self.artist().all()), 1)
+        self.assertEqual(self.artist().first().first_name, "Jeff")
+
+        r2 = self.artist.row("Do", "Little")
+        r2.save()
+        self.assertEqual(r2.id, 2)
+
+        # delete
+        r2.delete()
+        self.assertEqual(r2.id, None)
+        self.assertEqual(len(self.artist().all()), 1)
+        self.assertEqual(self.artist().first().first_name, "Jeff")
+
+    def test_foreign_key(self):
+        db = self.initDatabase()
+        artist = self.artist.row("Doja", "Cat").save()
+        album = self.album.row(artist, "Hot Pink").save()
+        self.assertEqual(album.artist.id, artist.id)
+        self.assertEqual(album.artist.first_name, "Doja")
+
+    def test_lookups(self):
+        db = self.initDatabase()
+
+        doja = self.artist.row("Doja", "Cat").save()
+        hot_pink = self.album.row(doja, "Hot Pink").save()
+
+        bd = datetime.date(1995, 10, 21)
+        mushroom = self.artist.row("Infected", "Mushroom", bd).save()
+        nasa = self.album.row(mushroom, "Head of NASA and the two Amish boys").save()
+        shawarma = self.album.row(mushroom, "The Legend of the Black Shawarma").save()
+        self.assertListEqual(
+            [nasa, shawarma],
+            self.album(artist=mushroom).all(),
+        )
+        self.assertEqual(
+            [hot_pink],
+            self.album(artist__birthday__ne=bd).all(),
+        )
+
+    @unittest.skip("not implemented")
+    def test_dirty_check(self):
+        # track if the row is dirty, and do a recursive save over foreign keys
+        pass
 
 
 if __name__ == '__main__':

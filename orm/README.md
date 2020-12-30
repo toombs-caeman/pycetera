@@ -1,7 +1,4 @@
-a model class acts like the table as a whole
-a model instance acts as if it were one or more rows of the table
-OR
-an unsaved row of the table
+# Worst Object-Relational Mapping (WORM)
 
 
 # row
@@ -20,10 +17,16 @@ an unsaved row of the table
 
 # lookups
 
+# foreign keys
+maybe features?
+* reverse lookups
+* select_with
+
+# types
+
 # database
 * convert to just a single init function
   """
-  the Worst Object-Relational Mapping (WORM)
 
 "works" with a sqlite backend
 
