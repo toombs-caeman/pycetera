@@ -1,5 +1,18 @@
 # Worst Object-Relational Mapping (WORM)
 
+TODO generate feature list and status via testcases? maybe w/ git hook?
+for now start with a feature list and a stop condition. I'm thinking 1000 lines (not including tsts)
+
+# features
+
+# future features
+
+# design
+`__repr__` is used to return strings needed to create the *sql* object, not the *python* object, as it is usually used.
+`__str__` is used similarly to reference a sql object in a query. 
+As such, `str(Model)` returns the table name, while `repr(Model)` returns a create table sql statement.
+They are the same for a query object.
+
 
 # row
 * render instance as upsert|delete
