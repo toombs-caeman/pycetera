@@ -1,3 +1,4 @@
+import abc
 import logging
 import unittest
 from datetime import date, datetime
@@ -11,14 +12,6 @@ SetDefault = "set default"
 Cascade = "cascade"
 
 
-class Row(sql.Row):
-    def __getattr__(self, item):
-        return self[item]
-
-    def __repr__(self):
-        return repr((*self,))
-
-
 def initialize_database(database="file::memory:?cache=shared", DEBUG=False, **options):
     options = {"database": database, "detect_types": sql.PARSE_DECLTYPES, "uri": True, **options}
 
@@ -30,7 +23,7 @@ def initialize_database(database="file::memory:?cache=shared", DEBUG=False, **op
         c.execute("pragma foreign_key = 1")
         c.row_factory = Row
         if DEBUG:
-            c.set_trace_callback(log.info)
+            c.set_trace_callback(log.debug)
         return c
 
     def all_subclasses(cls):
@@ -88,7 +81,7 @@ def initialize_database(database="file::memory:?cache=shared", DEBUG=False, **op
 
 
 def clean_dict(d):
-    return {k: v.id if isinstance(v, _model_row) else v for k, v in d.items()}
+    return {k: v.id if isinstance(v, ModelRow) else v for k, v in d.items()}
 
 
 def _named_list(*names, **defaults):
@@ -165,7 +158,15 @@ class Field(
         )
 
 
-class _model_row:
+class Row(sql.Row, abc.ABC):
+    def __getattr__(self, item):
+        return self[item]
+
+    def __repr__(self):
+        return repr((*self,))
+
+
+class ModelRow:
     _model = None
 
     def __getattr__(self, item):
@@ -191,6 +192,7 @@ class _model_row:
             f"INSERT INTO {self._model} VALUES ({', '.join(f':{f}' for f in self._model)}) "
             f"ON CONFLICT(id) DO UPDATE SET {', '.join(f'{f}=:{f}' for f in self._model)} WHERE id=:id"
         )
+        print(render, clean_dict(self._fields))
         with self._model._connect() as conn:
             self.id = conn.execute(render, clean_dict(self._fields)).lastrowid or self.id
         return self
@@ -199,6 +201,7 @@ class _model_row:
         # a row is also considered equal to its id
         return isinstance(other, int) and self.id == other or super().__eq__(other)
 
+Row.register(ModelRow)
 
 class _model_meta(type):
     def __new__(cls, name, bases, dct):
@@ -212,7 +215,7 @@ class _model_meta(type):
         # register row type
         model.row = type(
             f'_{model}_row',
-            (_model_row, _named_list(**{f.name: f.default for f in model})),
+            (ModelRow, _named_list(**{f.name: f.default for f in model})),
             {"_model": model},
         )
         return model
@@ -371,13 +374,13 @@ class TestCase(unittest.TestCase):
                 conn.execute(f"drop table {r[0]}")
 
     def initDatabase(self):
-        return initialize_database(self.db)
+        return initialize_database(self.db, DEBUG=True)
 
 
 class LibTest(TestCase):
     @classmethod
     def setUpClass(cls):
-        logging.basicConfig(level=logging.WARNING)
+        logging.basicConfig(level=logging.INFO)
 
         class Artist(Model):
             first_name = last_name = Field(str, "NA")
