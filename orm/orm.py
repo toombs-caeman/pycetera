@@ -256,76 +256,70 @@ class Model(object, metaclass=_model_meta):
 
     def __repr__(self):
         """Represent the query that would be executed minus type adaptation."""
-        query, params = self._render
-        for k, v in params.items():
+        query = self.__select
+        for k, v in clean_dict(self.__filters):
             query = query.replace(f':{k}', repr(v))
         return query
 
     @property
-    def _render(self):
-        # render where clause
+    def __where(self):
         cmp = {"eq": "=", "gt": ">", "lt": "<", "ge": ">=", "le": "<=", "ne": "<>", "in": "in"}
         clauses = []
         for filter, value in clean_dict(self.__filters).items():
             clause = "{}"
-            subq = "{} IN (SELECT id FROM {} WHERE {})"
             model = type(self)
-            fields = filter.split("__")[::-1]
-            op = cmp[fields.pop(0)] if fields[0] in cmp else "="
-            # get
-            while len(fields) > 1:
-                field = fields.pop()
+            fields = filter.split("__")
+            op = cmp[fields.pop()] if fields[-1] in cmp else "="
+            for field in fields[:-1]:
                 model = getattr(model, field).type
-                clause = clause.format(subq).format(field, model, "{}")
-            clauses.append(clause.format(f'{fields.pop()} {op} :{filter}'))
+                clause = clause.format("{} IN (SELECT id FROM {} WHERE {})").format(field, model, "{}")
+            clauses.append(clause.format(f'{fields[-1]} {op} :{filter}'))
+        return ' AND '.join(clauses) or 1
 
-        # final render
-        return (
-            f"SELECT {', '.join(self.__values) or '*'} FROM {type(self)} WHERE {' AND '.join(clauses) or 1}",
-            clean_dict(self.__filters),
-        )
+    @property
+    def __fields(self):
+        return ', '.join(self.__values) or '*'
 
-    def __iter__(self):
+    def __execute(self, query):
         with type(self)._connect() as conn:
             if self.__values:
                 conn.row_factory = Row
-            return conn.execute(*self._render)
+            return conn.execute(query, clean_dict(self.__filters))
+
+    def __iter__(self):
+        return self.__execute(f"SELECT {self.__fields} FROM {type(self)} WHERE {self.__where}")
 
     def all(self):
-        return iter(self).fetchall()
+        return list(self)
 
     def first(self):
-        return iter(self).fetchone()
+        return next(iter(self))
 
-    def delete(self):
-        """return a count of deleted objects."""
-        raise NotImplementedError
+    def delete(self, **filters):
+        if filters: return self(**filters).delete()
+        return self.__execute(f"DELETE FROM {type(self)} WHERE {self.__where}")
 
-    def update(self, **fields):
-        """return a count of updated objects."""
-        raise NotImplementedError
-        T = type(self)
-        return (
-            f"insert into {T} values ({', '.join(['?'] * len(T._fields))})",
-            [getattr(self, f.name) for f in T._fields]
-        )
+    def update(self, **filters):
+        if filters: return self(**filters).update()
+        fields = ', '.join(f'{f.name}=:{f.name}' for f in self.__filters if '__' not in f)
+        return self.__execute(f"UPDATE {type(self)} SET {fields} WHERE {self.__where}")
 
     def get(self, **filters):
-        """
-        fetch a single row if it exists.
-
-        filters with a lookup are ignored (including '__eq') but others are used as field values.
-        """
-        items = iter(self(*self.__values, **filters) if filters else self).fetchmany(2)
+        if filters: return self(**filters).get()
+        items = iter(self).fetchmany(2)
         if len(items) != 1: raise ValueError(f"{['No', 'Multiple'][bool(items)]} objects returned by get.")
         return items[0]
 
     def create(self, **filters):
         # ignore fields with lookups
-        return type(self).row(**{k: v for k, v in {**self.__filters, **filters}.items() if not k.contains("__")}).save()
+        return type(self).row(**{k: v for k, v in {**self.__filters, **filters}.items() if "__" not in k}).save()
 
     def get_or_create(self, **filters):
-        return self.get(**filters) or self.create(**filters)
+        if filters: return self(**filters).get_or_create()
+        try:
+            return self.get()
+        except ValueError:
+            return self.create()
 
 
 class sqlite_master(Model):
@@ -468,9 +462,12 @@ class LibTest(TestCase):
             self.album(artist__birthday__ne=bd).all(),
         )
 
-    @unittest.skip("not implemented")
+    @unittest.skip(NotImplemented)
     def test_dirty_check(self):
         # track if the row is dirty, and do a recursive save over foreign keys
+        pass
+    @unittest.skip(NotImplemented)
+    def test_limit(self):
         pass
 
 
