@@ -1,6 +1,5 @@
 import abc
 import logging
-import sys
 import unittest
 import sqlite3 as sql
 
@@ -43,14 +42,17 @@ def initialize_database(database="file::memory:?cache=shared", debug=False, allo
 
     keep_alive = sql.connect(**options) if 'memory' in database else None
 
-    def connect(_=None):
+    def connect(model=None):
         keep_alive  # keep memory-only databases alive
         c = sql.connect(**options)
         c.execute("PRAGMA FOREIGN_KEY=1")
-        c.row_factory = Row
+        c.row_factory = model and (lambda c, r: model.row(*r)) or Row
         if debug:
             c.set_trace_callback(log.debug)
         return c
+
+    # allow connections
+    Model._connect = connect
 
     def all_subclasses(cls):
         subs = {*cls.__subclasses__()}
@@ -62,11 +64,12 @@ def initialize_database(database="file::memory:?cache=shared", debug=False, allo
         duplicates = {}
         for model in all_subclasses(Model):
             name = str(model)
-            if name.startswith('_'):
-                continue  # models that start with '_' are considered abstract
+            # models that start with '_' are considered abstract
+            # pseudo-models don't have an id
+            if name.startswith('_') or model.id is None:
+                continue
             if name in all_models:
                 duplicates.setdefault(name, []).append(model.__module__)
-            model._db = connect
             all_models[name] = model
         if duplicates:
             raise ImportError(
@@ -74,11 +77,9 @@ def initialize_database(database="file::memory:?cache=shared", debug=False, allo
             )
 
         # migrate database
-        extant_tables = dict(sqlite_master(type='table')["name", "sql"])
+        extant_tables = dict(sqlite_master(type='table')["name", "sql"].all())
         migrations = {}
         for name, model in all_models.items():
-            if model._special:
-                continue
             create_stmt = repr(model)
             if name not in extant_tables:
                 conn.execute(create_stmt)  # tables can be created from scratch w/o being considered a migration
@@ -119,64 +120,36 @@ COMMIT;
 def clean_dict(d):
     """Return an object suitable for saving."""
     # TODO raise error if d contains unsaved ModelRows
-    return {k: v.id if isinstance(v, ModelRow) else v for k, v in d.items()}
-
-
-def _named_list(*names, **defaults):
-    names = (*names, *defaults)
-
-    class named_list(dict):
-        __getattr__ = dict.__getitem__
-        __setattr__ = dict.__setitem__
-        __getitem__ = __setitem__ = None
-
-        def __iter__(self):
-            return iter(self.values())
-
-        def __init__(self, *args, **kwargs):
-            args = list(reversed(args))
-            try:
-                dict.__init__(
-                    self,
-                    ((n, kwargs.pop(n) if n in kwargs else args.pop() if args else defaults[n]) for n in names),
-                )
-                if args or kwargs:
-                    j = ', '.join
-                    raise TypeError(
-                        f"Extra arguments ({j((*j(map(repr, args)), j(f'{k}={v!r}' for k, v in kwargs.items())))})."
-                    )
-            except KeyError:
-                raise TypeError("Not enough arguments passed.")
-
-    return named_list
+    return {k: v['id'] if isinstance(v, ModelRow) else v for k, v in d.items()}
 
 
 # track registered types and provide a way to register more
 # converter(bytes) -> obj  and  adapter(obj) -> int, float, str, or bytes
 types = type('Type', (dict,), {
-    'register': lambda ns, t, n, c, a: (ns.__setitem(t, n), sql.register_converter(n, c), sql.register_adapter(t, a)),
-})({
+    'register': lambda ns, t, n, c, a: (
+        ns.__setitem(t, n), sql.register_converter(n, c), sql.register_adapter(t, a)), })({
     type(None): "NULL", int: "INTEGER", float: "REAL", str: "TEXT", bytes: "BLOB", sql.Date: "DATE",
     sql.Timestamp: "TIMESTAMP",
 })
 
 
-class Field(
-    _named_list(
-        "type",
-        default=None, primary_key=False, not_null=False, on_delete="", on_update="", generate="", stored=False, name=""
-    )
-):
+class Field:
+    def __init__(
+            self, type, default=None, primary_key=False, not_null=False, on_delete="", on_update="", generate="",
+            stored=False, name=""
+    ):
+        self.__dict__.update(
+            name=name, type=type, on_delete=on_delete, on_update=on_update, default=default,
+            primary_key=primary_key, not_null=not_null, generate=generate, stored=stored,
+        )
+
     def __str__(self):
         return self.name
 
     def __repr__(self):
         return " ".join(
             value for condition, value in zip(
-                (
-                    self.name, self.type, self.on_delete, self.on_update, self.default,
-                    self.primary_key, self.not_null, self.generate, self.stored
-                ),
+                self.__dict__.values(),
                 (
                     self.name,
                     [types.get(self.type, "BLOB"), f'INTEGER REFERENCES {self.type}'][issubclass(self.type, Model)],
@@ -197,17 +170,38 @@ class Row(sql.Row, abc.ABC):
         return repr((*self,))
 
 
-class ModelRow:
+class ModelRow(dict):
     _model = None
 
+    def __init__(self, *args, **kwargs):
+        args = list(reversed(args))
+        super().__init__(
+            {
+                field.name: kwargs.pop(field.name) if field.name in kwargs
+                else args.pop() if args
+                else field.default
+                for field in self._model
+            },
+        )
+    def __iter__(self):
+        return iter(self.values())
+
     def __getattr__(self, item):
-        value = dict.__getitem__(self, item)
+        value = self[item]
         # handle foreign keys
         fk = getattr(self._model, item)
         if isinstance(value, int) and issubclass(fk.type, Model):
-            self._fields[item] = fk.type.get(id=value)
-            return self._fields[item]
+            value = fk.type.get(id=value)
+            self[item] = value
         return value
+
+    def __setattr__(self, key, value):
+        if key in self:
+            self[key] = value
+
+    def __eq__(self, other):
+        # a row is also considered equal to its id
+        return isinstance(other, int) and self.id == other or super().__eq__(other)
 
     def delete(self):
         if self.id:
@@ -227,10 +221,6 @@ class ModelRow:
             self.id = conn.execute(render, clean_dict(self)).lastrowid or self.id
         return self
 
-    def __eq__(self, other):
-        # a row is also considered equal to its id
-        return isinstance(other, int) and self.id == other or super().__eq__(other)
-
 
 Row.register(ModelRow)
 
@@ -238,18 +228,14 @@ Row.register(ModelRow)
 class _model_meta(type):
     def __new__(cls, name, bases, dct):
         # register fields
-        dct.update({k: Field(*(*v,)[:-1], name=k) for k, v in dct.items() if isinstance(v, Field)})
+        dct.update({k: Field(**{**v.__dict__, 'name': k}) for k, v in dct.items() if isinstance(v, Field)})
         for base in bases:
             dct.update({k: v for k, v in base.__dict__.items() if k not in dct and isinstance(v, Field)})
+        # dct['_fields'] = tuple(k for k in dct if isinstance(dct[k], Field))
         dct['_fields'] = tuple((v for v in dct.values() if isinstance(v, Field)))
         # create type
         model = super().__new__(cls, name, bases, dct)
-        # register row type
-        model.row = type(
-            f'_{model}_row',
-            (ModelRow, _named_list(**{f.name: f.default for f in model})),
-            {"_model": model},
-        )
+        model.row = type(f'{model}_row', (model.row,), {'_model': model})
         return model
 
     def __str__(cls):
@@ -258,20 +244,14 @@ class _model_meta(type):
     def __iter__(cls):
         return iter(cls._fields)
 
-    def __getitem__(cls, item):
-        return cls()[item]
-
     def __repr__(cls):
         return f"CREATE TABLE {cls} ({', '.join(map(repr, cls))})"
 
-    def _connect(cls):
-        conn = cls._db()
-        conn.row_factory = lambda c, r: cls.row(*r)
-        return conn
 
 class Model(metaclass=_model_meta):
-    _special = False  # marker for sqlite reserved tables and pseudo-tables
     id = Field(int, primary_key=True, not_null=True)
+    row = ModelRow
+    _connect = lambda s: None  # placeholder
 
     def __init__(self, *fields, **filters):
         self._fields = fields
@@ -287,12 +267,31 @@ class Model(metaclass=_model_meta):
 
     def __repr__(self):
         query = self._select
-        for k, v in clean_dict(self._filters).items():
-            query = query.replace(f':{k}', repr(v))
+        params = dict(zip(
+            self._filters,
+            self._connect().execute(
+                f"SELECT {', '.join('?' * len(self._filters))}",
+                tuple(clean_dict(self._filters).values()),
+            ).fetchone(),
+        ))
+        for k, v in sorted(params.items(), reverse=True):  # replace longest keys first
+            query = query.replace(f':{k}', v)
         return query
 
+    def _execute(self, query):
+        with type(self)._connect() if self._fields else self._connect() as conn:
+            return conn.execute(query, clean_dict(self._filters))
+
+    def __iter__(self):
+        return self._execute(self._select)
+
+    def count(self):
+        return self._connect().execute(
+            f"SELECT COUNT(*) FROM {type(self)} WHERE {self._where}", clean_dict(self._filters)
+        ).fetchone()[0]
+
     @property
-    def __where(self):
+    def _where(self):
         cmp = {"eq": "=", "gt": ">", "lt": "<", "ge": ">=", "le": "<=", "ne": "<>", "in": "in"}
         clauses = []
         for filter, value in clean_dict(self._filters).items():
@@ -308,25 +307,7 @@ class Model(metaclass=_model_meta):
 
     @property
     def _select(self):
-        return f"SELECT {', '.join(self._fields) or '*'} FROM {type(self)} WHERE {self.__where}"
-
-    def __execute(self, query):
-        with type(self)._connect() as conn:
-            if self._fields:
-                conn.row_factory = Row
-            return conn.execute(query, clean_dict(self._filters))
-
-    def __iter__(self):
-        return self.__execute(self._select)
-
-    def __bool__(self):
-        return bool(self.count())
-
-    def count(self):
-        return self._db().execute(
-            f"SELECT COUNT(*) FROM {type(self)} WHERE {self.__where}",
-            clean_dict(self._filters),
-        ).fetchone()[0]
+        return f"SELECT {', '.join(map(str, type(self))) or '*'} FROM {type(self)} WHERE {self._where}"
 
     def all(self):
         return list(self)
@@ -334,27 +315,27 @@ class Model(metaclass=_model_meta):
     def first(self):
         return next(iter(self))
 
-    def delete(self, **filters):
-        if filters: return self(**filters).delete()
-        return self.__execute(f"DELETE FROM {type(self)} WHERE {self.__where}")
-
-    def update(self, **filters):
-        if filters: return self(**filters).update()
-        fields = ', '.join(f'{f}=:{f}' for f in self._filters if '__' not in f)
-        return self.__execute(f"UPDATE {type(self)} SET {fields} WHERE {self.__where}")
-
     def get(self, **filters):
-        if filters: return self(**filters).get()
+        if filters: self = self(**filters)
         items = iter(self).fetchmany(2)
         if len(items) != 1: raise ValueError(f"{['No', 'Multiple'][bool(items)]} objects returned by get.")
         return items[0]
+
+    def delete(self, **filters):
+        if filters: self = self(**filters)
+        return self._execute(f"DELETE FROM {type(self)} WHERE {self._where}")
+
+    def update(self, **filters):
+        if filters: self = self(**filters)
+        fields = ', '.join(f'{f}=:{f}' for f in self._filters if '__' not in f)
+        return self._execute(f"UPDATE {type(self)} SET {fields} WHERE {self._where}")
 
     def create(self, **filters):
         # ignore fields with lookups
         return type(self).row(**{k: v for k, v in {**self._filters, **filters}.items() if "__" not in k}).save()
 
     def get_or_create(self, **filters):
-        if filters: return self(**filters).get_or_create()
+        if filters: self = self(**filters)
         try:
             return self.get()
         except ValueError:
@@ -366,29 +347,24 @@ for k, v in Model.__dict__.items():
     if isinstance(v, type(lambda: None)) and not k.startswith("_"):
         setattr(_model_meta, k, (lambda k: (property(lambda cls: getattr(cls(), k))))(k))
 
-class _special_table(Model):
-    _special = True
+
+class sqlite_master(Model):
     id = None  # don't include id field
-
-    def create(self, **filters):
-        raise TypeError("cannot update special table.")
-
-    update = delete = create
-
-class sqlite_master(_special_table):
     type = name = tbl_name = Field(str)
-    root_page = Field(int)
+    rootpage = Field(int)
     sql = Field(str)
 
-class table_info(_special_table):
+
+class table_info(Model):
+    id = None  # don't include id field
     cid = Field(int)
     name = type = Field(str)
     notnull = Field(int)
     dflt_value = Field(bytes)
     pk = Field(int)
+
     @property
     def _select(self):
-        self.__where
         return f"SELECT {', '.join(self._fields) or '*'} FROM pragma_table_info('{self._filters['table']}')"
 
 
@@ -406,6 +382,8 @@ class TestCase(unittest.TestCase):
 
 
 class LibTest(TestCase):
+    maxDiff = None
+
     @classmethod
     def setUpClass(cls):
         logging.basicConfig(level=logging.INFO)
@@ -420,15 +398,6 @@ class LibTest(TestCase):
 
         cls.artist = Artist
         cls.album = Album
-
-    def test_namedlist(self):
-        T = _named_list("a", "b", c=3, d=4)
-        # test that arguments are correctly counted
-        self.assertRaises(TypeError, T)
-        self.assertRaises(TypeError, T, 1, 2, 3, 4, 5)
-        self.assertRaises(TypeError, T, 2, 3, 4, 5, a=1)
-        self.assertEqual([1, 2, 3, 4], [*T(1, 2)])
-        self.assertEqual([1, 2, 3, 4], [*T(2, a=1)])
 
     def test_render(self):
         # field
@@ -461,7 +430,7 @@ class LibTest(TestCase):
         self.initDatabase()
         self.artist.row(first_name, last_name).save()
         self.assertEqual(
-            [f for f in self.artist.get(id=1)],
+            list(self.artist.get(id=1)),
             [first_name, last_name, sql.Date(year=1000, month=1, day=1), 1],
         )
 
